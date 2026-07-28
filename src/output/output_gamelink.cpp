@@ -52,7 +52,7 @@ void OUTPUT_GAMELINK_Select()
     render.aspectOffload = true;
     sdl.desktop.fullscreen = false;
     sdl.mouse.autoenable = false;
-    sdl.gamelink.want_mouse = false;
+    sdl.gamelink.want_mouse = true;  // DEBUG: 강제 true (기본 false)
 }
 
 void OUTPUT_GAMELINK_InputEvent()
@@ -73,12 +73,26 @@ void OUTPUT_GAMELINK_InputEvent()
 
         //
         // -- Input
+        //
+        // Mouse: the client sends an ABSOLUTE pixel position in mouse_dx/dy
+        // (not a delta). We set the emulated cursor directly, bypassing the
+        // mickey scaling and lock-state checks of Mouse_CursorMoved that made
+        // delta injection unreliable when the host window is hidden in
+        // fully-remote mode.
+        //
+        // Sentinel: mouse_dx < 0 means "no position update this frame"
+        // (e.g. a button-only action). This avoids resetting the cursor to
+        // (0,0) on frames where the client only changes button state, because
+        // GameLink::In() clears mouse_dx/dy to 0 after consuming, and a plain
+        // 0,0 would be interpreted as a move to the top-left corner.
 
-        Mouse_CursorMoved( 
-            sdl.gamelink.input.mouse_dx, 
-            sdl.gamelink.input.mouse_dy, 
-            0, 
-            0, true /*emulate*/ );
+        if ( sdl.gamelink.input.mouse_dx >= 0.0f )
+        {
+            extern void Mouse_SetClientCursorPos(int16_t x, int16_t y);
+            Mouse_SetClientCursorPos(
+                (int16_t)sdl.gamelink.input.mouse_dx,
+                (int16_t)sdl.gamelink.input.mouse_dy );
+        }
 
         // Cache old and new
         const uint8_t old = sdl.gamelink.input_prev.mouse_btn;;
@@ -239,6 +253,7 @@ Bitu OUTPUT_GAMELINK_SetSize()
 bool OUTPUT_GAMELINK_StartUpdate(uint8_t* &pixels, Bitu &pitch)
 {
     //LOG_MSG("OUTPUT_GAMELINK: StartUpdate");
+    static int dbg_updatecount = 0;
 #if C_XBRZ
     if (sdl_xbrz.enable && sdl_xbrz.scale_on)
     {
@@ -253,6 +268,13 @@ bool OUTPUT_GAMELINK_StartUpdate(uint8_t* &pixels, Bitu &pitch)
         pitch = sdl.gamelink.pitch;
     }
 
+    if ((dbg_updatecount++ % 60) == 0) {
+        LOG_MSG("GAMELINK-DBG StartUpdate: framebuf=%p draw=%ux%u clip=%ux%u+%u+%u pitch=%u pixels=%p",
+            sdl.gamelink.framebuf, (unsigned)sdl.draw.width, (unsigned)sdl.draw.height,
+            (unsigned)sdl.clip.w, (unsigned)sdl.clip.h, (unsigned)sdl.clip.x, (unsigned)sdl.clip.y,
+            (unsigned)pitch, pixels);
+    }
+
     sdl.updating = true;
     return true;
 }
@@ -260,6 +282,19 @@ bool OUTPUT_GAMELINK_StartUpdate(uint8_t* &pixels, Bitu &pitch)
 void OUTPUT_GAMELINK_Transfer()
 {
     //LOG_MSG("OUTPUT_GAMELINK: Transfer");
+    static int dbg_transfercount = 0;
+    const uint32_t* fb32 = (const uint32_t*)sdl.gamelink.framebuf;
+    if ((dbg_transfercount++ % 60) == 0 && fb32) {
+        // framebuf 처음 4픽셀 + non-zero 개수 샘플
+        unsigned nonzero = 0;
+        const unsigned total = (unsigned)sdl.clip.w * (unsigned)sdl.clip.h;
+        for (unsigned i = 0; i < total && i < 640*480; i++) {
+            if (fb32[i]) nonzero++;
+        }
+        LOG_MSG("GAMELINK-DBG Transfer: w=%u h=%u fb[0..3]=%08X %08X %08X %08X nonzero=%u/%u",
+            (unsigned)(sdl.clip.w+2*sdl.clip.x), (unsigned)(sdl.clip.h+2*sdl.clip.y),
+            fb32[0], fb32[1], fb32[2], fb32[3], nonzero, total);
+    }
     GameLink::Out( (uint16_t)sdl.clip.w+2*sdl.clip.x, (uint16_t)sdl.clip.h+2*sdl.clip.y, render.src.ratio,
         sdl.gamelink.want_mouse,
         RunningProgram,

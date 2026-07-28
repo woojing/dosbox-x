@@ -863,6 +863,28 @@ static bool AllowINT33RMAccess() {
 bool IsDebuggerActive(void);
 #endif
 
+/* Forward declaration: defined later in this file but used by
+ * Mouse_SetClientCursorPos below. (DrawCursor is already defined above
+ * at line ~724.) */
+void Mouse_Used(void);
+
+/* Set the emulated mouse cursor to an absolute pixel position directly,
+ * bypassing the mickey/delta scaling and lock-state checks of
+ * Mouse_CursorMoved. Intended for GameLink client input where the client
+ * tracks an absolute cursor position (delta-only input is unreliable when
+ * the host window is hidden in fully-remote mode). Values are clamped to
+ * the current min/max range set by INT 33h AX=7/AX=8. */
+void Mouse_SetClientCursorPos(int16_t x, int16_t y) {
+    if (x > mouse.max_x) x = mouse.max_x;
+    if (x < mouse.min_x) x = mouse.min_x;
+    if (y > mouse.max_y) y = mouse.max_y;
+    if (y < mouse.min_y) y = mouse.min_y;
+    mouse.x = static_cast<float>(x);
+    mouse.y = static_cast<float>(y);
+    DrawCursor();
+    Mouse_Used();
+}
+
 /* FIXME: Re-test this code */
 void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate) {
     extern bool Mouse_Vertical;
