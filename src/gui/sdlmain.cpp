@@ -4099,6 +4099,13 @@ static void GUI_StartUp() {
     sdl.gamelink.loadaddr = section->Get_int("gamelink load address");
 #endif
 
+#if C_DEBUG
+    if (section->Get_bool("debug server")) {
+        void DEBUG_IPC_StartUp(int port);
+        DEBUG_IPC_StartUp((int)section->Get_int("debug server port"));
+    }
+#endif
+
 
 #if C_XBRZ
     // initialize xBRZ parameters and check output type for compatibility
@@ -7023,6 +7030,13 @@ void SDL_SetupConfigSection() {
     Pbool->Set_help("Connect to an existing Game Link session and output link data instead of sending own data. Compares memory contents to find a suitable memory offset of peeks.");
     Pint = sdl_sec->Add_int("gamelink load address", Property::Changeable::Always, 0);
     Pbool->Set_help("Configure the original load address of the software (when running in plain DOSBox) so that gamelink accesses are adjusted for different load addresses.");
+#endif
+
+#if C_DEBUG
+    Pbool = sdl_sec->Add_bool("debug server", Property::Changeable::OnlyAtStart, false);
+    Pbool->Set_help("Enable the debugger IPC server: a loopback TCP channel (127.0.0.1, newline-delimited JSON) that executes debugger commands while the guest is stopped. The bound port is logged at startup.");
+    Pint = sdl_sec->Add_int("debug server port", Property::Changeable::OnlyAtStart, 0);
+    Pint->Set_help("TCP port for the debugger IPC server on 127.0.0.1. 0 (default) selects an ephemeral port.");
 #endif
 
     Pint = sdl_sec->Add_int("overscan",Property::Changeable::Always, 0);
@@ -10143,7 +10157,11 @@ fresh_boot:
         /* FIXME: throwing int() is a stupid and nondescriptive way to signal shutdown/reset. */
         try {
 #if C_DEBUG
-            if (control->opt_break_start) DEBUG_EnableDebugger();
+            if (control->opt_break_start) {
+                void DEBUG_IPC_SetStopReason(const char* reason);
+                DEBUG_IPC_SetStopReason("initial_break");
+                DEBUG_EnableDebugger();
+            }
 #endif
             DOSBOX_RunMachine();
         } catch (int x) {

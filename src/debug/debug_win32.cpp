@@ -79,6 +79,25 @@ void DEBUG_ShowMsg(char const* format,...);
 void WIN32_Console() {
 	AllocConsole();
 	SetConsoleTitle("DOSBox-X Debugger");
+	/* Bind the Win32 standard handles to the new console. AllocConsole does
+	   not replace inherited handles, so when the parent gave us pipes (shell
+	   or daemon capture) GetStdHandle() still returns them; pdcurses then
+	   fails in PDC_scr_open() and initscr() exit(8)s ("Unable to create SP").
+	   Explicit CONIN$/CONOUT$ rebinding makes the debugger console usable
+	   regardless of how the process was launched. The CRT-level freopen()
+	   calls in DBGUI_StartUp() remain as they are. */
+	{
+		HANDLE hConOut = CreateFile("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+		HANDLE hConIn = CreateFile("CONIN$", GENERIC_READ | GENERIC_WRITE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+		if (hConOut != INVALID_HANDLE_VALUE) {
+			SetStdHandle(STD_OUTPUT_HANDLE, hConOut);
+			SetStdHandle(STD_ERROR_HANDLE, hConOut);
+		}
+		if (hConIn != INVALID_HANDLE_VALUE)
+			SetStdHandle(STD_INPUT_HANDLE, hConIn);
+	}
 	HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
 	DWORD dwMode = 0;
 	if (GetConsoleMode(hOut, &dwMode)) SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);

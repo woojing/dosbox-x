@@ -47,6 +47,7 @@ using namespace std;
 #include "paging.h"
 #include "shell.h"
 #include "debug_inc.h"
+#include "debug_ipc.h"
 #include "../cpu/lazyflags.h"
 #include "keyboard.h"
 #include "control.h"
@@ -596,6 +597,9 @@ public:
 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
 	static bool				DeleteByIndex		(uint16_t index);
+	static bool				DeleteBreakpoint	(CBreakpoint* bp);
+	static int				Count				(void);
+	static CBreakpoint*		GetByIndex			(int index);
 	static void				DeleteAll			(void);
 	static void				ShowList			(void);
 
@@ -854,6 +858,40 @@ bool CBreakpoint::DeleteByIndex(uint16_t index)
 	return false;
 }
 
+int CBreakpoint::Count(void)
+{
+	return (int)BPoints.size();
+}
+
+CBreakpoint* CBreakpoint::GetByIndex(int index)
+{
+	if (index < 0)
+		return nullptr;
+	int nr = 0;
+	std::list<CBreakpoint*>::iterator i;
+	for (i = BPoints.begin(); i != BPoints.end(); ++i, nr++) {
+		if (nr == index)
+			return *i;
+	}
+	return nullptr;
+}
+
+bool CBreakpoint::DeleteBreakpoint(CBreakpoint* bp)
+{
+	if (bp == nullptr)
+		return false;
+	std::list<CBreakpoint*>::iterator i;
+	for (i = BPoints.begin(); i != BPoints.end(); ++i) {
+		if (*i == bp) {
+			(BPoints.erase)(i);
+			bp->Activate(false);
+			delete bp;
+			return true;
+		}
+	}
+	return false;
+}
+
 CBreakpoint* CBreakpoint::FindPhysBreakpoint(uint16_t seg, uint32_t off, bool once)
 {
 	if (BPoints.empty()) return nullptr;
@@ -944,6 +982,7 @@ bool DEBUG_Breakpoint(void)
 	// Found. Breakpoint is valid
 //	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
+	DEBUG_IPC_SetStopReason("breakpoint");
 	return true;
 }
 
@@ -955,6 +994,7 @@ bool DEBUG_IntBreakpoint(uint8_t intNum)
 	if (!CBreakpoint::CheckIntBreakpoint(where,intNum,reg_ah,reg_al)) return false;
 	// Found. Breakpoint is valid
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
+	DEBUG_IPC_SetStopReason("int_breakpoint");
 	return true;
 }
 
@@ -4911,8 +4951,13 @@ Bitu DEBUG_Loop(void) {
             mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
             DOSBOX_SetNormalLoop();
             DrawRegistersUpdateOld();
+            DEBUG_IPC_NotifyRunning(); /* interrupt started: silent resume */
             return 0;
         }
+
+        /* Service the debugger IPC server (non-blocking; commands run
+         * only here, with the guest stopped). */
+        if (DEBUG_IPC_Poll() != 0) return 0;
 
         /* between DEBUG_Enable and DEBUG_Loop CS:EIP can change */
         if (check_rescroll) {
@@ -5041,6 +5086,7 @@ void DEBUG_Enable_Handler(bool pressed) {
 	SetCodeWinStart();
 	DEBUG_DrawScreen();
 	DOSBOX_SetLoop(&DEBUG_Loop);
+	DEBUG_IPC_NotifyStopped(); /* authoritative stop event */
 	mainMenu.get_item("mapper_debugger").check(true).refresh_item(mainMenu);
     if(!CPU_IsDynamicCore()) warn_dynamic = false;
     else if(!warn_dynamic) {
@@ -5759,6 +5805,68 @@ Bitu DEBUG_EnableDebugger(void)
 	CPU_CycleLeft += CPU_Cycles;
 	CPU_Cycles = 0;
 	return 0;
+}
+
+/* --- Debugger IPC hooks (transport lives in debug_ipc.cpp) --- */
+
+void* DEBUG_IPC_BPAddCode(uint16_t seg, uint32_t off)
+{
+	return CBreakpoint::AddBreakpoint(seg, off, false);
+}
+
+void* DEBUG_IPC_BPAddInt(uint8_t int_nr, int ah, int al)
+{
+	return CBreakpoint::AddIntBreakpoint(int_nr,
+		(uint16_t)(ah < 0 ? BPINT_ALL : ah),
+		(uint16_t)(al < 0 ? BPINT_ALL : al), false);
+}
+
+bool DEBUG_IPC_BPDelete(void* handle)
+{
+	return CBreakpoint::DeleteBreakpoint((CBreakpoint*)handle);
+}
+
+void DEBUG_IPC_BPDeleteAll(void)
+{
+	CBreakpoint::DeleteAll();
+}
+
+bool DEBUG_IPC_BPGet(int index, void** handle, int* kind, uint16_t* seg,
+                     uint32_t* off, int* int_nr, int* ah, int* al)
+{
+	CBreakpoint* bp = CBreakpoint::GetByIndex(index);
+	if (bp == nullptr)
+		return false;
+	if (handle) *handle = bp;
+	if (kind) {
+		if (bp->GetType() == BKPNT_PHYSICAL)
+			*kind = 0;
+		else if (bp->GetType() == BKPNT_INTERRUPT)
+			*kind = 1;
+		else
+			*kind = 2;
+	}
+	if (seg) *seg = bp->GetSegment();
+	if (off) *off = bp->GetOffset();
+	if (int_nr) *int_nr = bp->GetIntNr();
+	if (ah) *ah = (bp->GetType() == BKPNT_INTERRUPT && bp->GetValue() != BPINT_ALL) ? bp->GetValue() : -1;
+	if (al) *al = (bp->GetType() == BKPNT_INTERRUPT && bp->GetOther() != BPINT_ALL) ? bp->GetOther() : -1;
+	return true;
+}
+
+bool DEBUG_IPC_DoStep(void)
+{
+	DrawRegistersUpdateOld();
+	exitLoop = false;
+	mustCompleteInstruction = true;
+	DEBUG_Run(1, true);
+	mustCompleteInstruction = false;
+	return true;
+}
+
+const char* DEBUG_IPC_CoreName(void)
+{
+	return CPU_IsDynamicCore() ? "dynamic" : "normal";
 }
 
 // INIT
