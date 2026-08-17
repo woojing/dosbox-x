@@ -35,8 +35,16 @@
 /* Called once from GUI_StartUp() when [sdl] debug server = true.
  * port 0 picks an ephemeral port; the bound port is logged immediately
  * (before any debugger console can exist) so launchers can parse it
- * from the boot log. */
-void DEBUG_IPC_StartUp(int port);
+ * from the boot log. break_port opens a second, dedicated listener whose
+ * only accepted request is "break_request" (v1.1 forced-stop channel,
+ * serviced by a background thread while the guest runs); also 0 =
+ * ephemeral, also logged. */
+void DEBUG_IPC_StartUp(int port, int break_port);
+
+/* Test-and-clear the break_request flag. Call from GFX_Events(); a
+ * non-zero return means the caller should invoke DEBUG_EnableDebugger()
+ * (NOT DEBUG_Enable_Handler, which toggles) to stop the guest. */
+int DEBUG_IPC_BreakRequested(void);
 
 /* One non-blocking service step. Call from the DEBUG_Loop() stop branch
  * every iteration: accepts a pending client, drains complete request
@@ -52,7 +60,7 @@ void DEBUG_IPC_NotifyRunning(void);
 
 /* Stop-reason instrumentation: call right before DEBUG_EnableDebugger()
  * at each entry point. Values used: initial_break, breakpoint,
- * int_breakpoint, step. */
+ * int_breakpoint, step, break_request. */
 void DEBUG_IPC_SetStopReason(const char* reason);
 
 /* --- Guest-state hooks, implemented in debug.cpp --- */

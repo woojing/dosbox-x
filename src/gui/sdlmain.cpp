@@ -4101,8 +4101,10 @@ static void GUI_StartUp() {
 
 #if C_DEBUG
     if (section->Get_bool("debug server")) {
-        void DEBUG_IPC_StartUp(int port);
-        DEBUG_IPC_StartUp((int)section->Get_int("debug server port"));
+        void DEBUG_IPC_StartUp(int port, int break_port);
+        DEBUG_IPC_StartUp(
+            (int)section->Get_int("debug server port"),
+            (int)section->Get_int("debug server break port"));
     }
 #endif
 
@@ -5929,6 +5931,23 @@ void GFX_Events() {
     if (sdl.desktop.type == SCREEN_GAMELINK) OUTPUT_GAMELINK_InputEvent();
 #endif
 
+#if C_DEBUG
+    /* Debugger IPC forced stop (v1.1): a break_request on the dedicated
+     * channel asks to interrupt the running guest. DEBUG_EnableDebugger()
+     * is the correct entry (DEBUG_Enable_Handler is a toggle and would
+     * disable an active debugger instead). While already stopped the
+     * EnableDebugger guard makes this a no-op. */
+    {
+        int DEBUG_IPC_BreakRequested(void);
+        void DEBUG_IPC_SetStopReason(const char* reason);
+        Bitu DEBUG_EnableDebugger(void);
+        if (DEBUG_IPC_BreakRequested()) {
+            DEBUG_IPC_SetStopReason("break_request");
+            DEBUG_EnableDebugger();
+        }
+    }
+#endif
+
 #if (defined(WIN32) && !defined(HX_DOS) || defined(LINUX) && C_X11 || defined(MACOSX)) && (defined(C_SDL2) || defined(SDL_DOSBOX_X_SPECIAL))
    if(IS_PC98_ARCH) {
        static uint32_t poll98_delay = 0;
@@ -7037,6 +7056,8 @@ void SDL_SetupConfigSection() {
     Pbool->Set_help("Enable the debugger IPC server: a loopback TCP channel (127.0.0.1, newline-delimited JSON) that executes debugger commands while the guest is stopped. The bound port is logged at startup.");
     Pint = sdl_sec->Add_int("debug server port", Property::Changeable::OnlyAtStart, 0);
     Pint->Set_help("TCP port for the debugger IPC server on 127.0.0.1. 0 (default) selects an ephemeral port.");
+    Pint = sdl_sec->Add_int("debug server break port", Property::Changeable::OnlyAtStart, 0);
+    Pint->Set_help("TCP port of the debugger IPC forced-stop channel (accepts only 'break_request', serviced while the guest runs). 0 (default) selects an ephemeral port.");
 #endif
 
     Pint = sdl_sec->Add_int("overscan",Property::Changeable::Always, 0);

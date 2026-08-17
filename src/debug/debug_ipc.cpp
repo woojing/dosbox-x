@@ -45,10 +45,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <map>
 #include <string>
 
+#include <SDL.h> /* SDL_CreateThread / SDL_Delay */
 #include "cpu.h"
 #include "mem.h"
 #include "paging.h" /* mem_readb_checked */
@@ -84,6 +86,14 @@ typedef int ipc_sock_t;
 
 static ipc_sock_t listen_socket = IPC_BAD_SOCKET;
 static ipc_sock_t client_socket = IPC_BAD_SOCKET;
+
+/* v1.1 forced-stop channel: dedicated listener + background thread that
+ * only honors "break_request" lines. GFX_Events() polls the flag (see
+ * DEBUG_IPC_BreakRequested) and stops the guest via DEBUG_EnableDebugger,
+ * replacing the Alt+F12/GameLink key injection path. */
+static ipc_sock_t break_listen_socket = IPC_BAD_SOCKET;
+static volatile int ipc_break_flag = 0;
+static int ipc_break_thread(void*); /* defined after the JSON parser */
 
 static const size_t IPC_MAX_OUTBUF = 4u * 1024u * 1024u; /* send buffer cap */
 static const size_t IPC_MAX_LINE   = 1024u * 1024u;      /* request line cap */
@@ -132,7 +142,7 @@ static void ipc_disconnect_client(void) {
     outbuf.clear();
 }
 
-void DEBUG_IPC_StartUp(int port) {
+void DEBUG_IPC_StartUp(int port, int break_port) {
     if (listen_socket != IPC_BAD_SOCKET)
         return; /* already started */
 
@@ -180,6 +190,35 @@ void DEBUG_IPC_StartUp(int port) {
     LOG_MSG("DEBUG_IPC: debugger IPC listening on 127.0.0.1:%u "
             "(connect while the guest is stopped)",
             (unsigned)real_port);
+
+    /* Dedicated forced-stop channel (v1.1): own listener + thread so a
+     * break_request can be serviced while the guest is running. */
+    ipc_sock_t b = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (b == IPC_BAD_SOCKET)
+        return;
+    setsockopt(b, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+    addr.sin_port = htons((unsigned short)break_port);
+    if (bind(b, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
+        listen(b, 1) != 0) {
+        LOG_MSG("DEBUG_IPC: break channel bind/listen failed (forced stop disabled)");
+        ipc_close_sock(b);
+        return;
+    }
+    unsigned short real_break_port = (unsigned short)break_port;
+    if (getsockname(b, (struct sockaddr*)&bound, &blen) == 0)
+        real_break_port = ntohs(bound.sin_port);
+    break_listen_socket = b;
+    LOG_MSG("DEBUG_IPC: break channel listening on 127.0.0.1:%u "
+            "(send {\"cmd\":\"break_request\"} to force a stop)",
+            (unsigned)real_break_port);
+    SDL_Thread* thread = SDL_CreateThread(ipc_break_thread, "dbgipc_brk", nullptr);
+    if (thread == nullptr) {
+        LOG_MSG("DEBUG_IPC: break thread spawn failed (forced stop disabled)");
+        ipc_close_sock(break_listen_socket);
+        break_listen_socket = IPC_BAD_SOCKET;
+        return;
+    }
+    SDL_DetachThread(thread);
 }
 
 static void ipc_try_accept(void) {
@@ -353,6 +392,73 @@ static bool ipc_uint(const std::string& s, unsigned long long* out) {
 static const std::string* ipc_arg(const IpcRequest& req, const char* key) {
     auto it = req.args.find(key);
     return it == req.args.end() ? nullptr : &it->second;
+}
+
+/* ---- v1.1 break_request listener (needs the parser above) ---- */
+
+static int ipc_break_thread(void*) {
+    /* Blocking accept is fine here: this socket serves only short-lived
+     * break_request connections while the main loop keeps its own single
+     * client on the command port. */
+    for (;;) {
+        ipc_sock_t c = accept(break_listen_socket, nullptr, nullptr);
+        if (c == IPC_BAD_SOCKET) {
+            SDL_Delay(50);
+            continue;
+        }
+        /* One request line, bounded wait. */
+#if defined(WIN32)
+        DWORD ms = 5000;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof(ms));
+#else
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
+        std::string line;
+        char chunk[512];
+        bool got = false;
+        while (line.size() < IPC_MAX_LINE) {
+            int n = (int)recv(c, chunk, sizeof(chunk), 0);
+            if (n <= 0)
+                break;
+            line.append(chunk, (size_t)n);
+            if (line.find('\n') != std::string::npos) {
+                got = true;
+                break;
+            }
+        }
+        std::string reply;
+        if (got) {
+            size_t nl = line.find('\n');
+            line.erase(nl == std::string::npos ? line.size() : nl);
+            IpcRequest req;
+            if (ipc_parse_request(line.c_str(), req) && req.cmd == "break_request") {
+                ipc_break_flag = 1;
+                reply = "{\"id\":" + std::to_string(req.id) +
+                        ",\"ok\":true,\"queued\":true}\n";
+            }
+            else {
+                reply = "{\"id\":0,\"ok\":false,\"error\":\"break channel only "
+                        "accepts break_request\"}\n";
+            }
+        }
+        else {
+            reply = "{\"id\":0,\"ok\":false,\"error\":\"break channel timeout\"}\n";
+        }
+        (void)send(c, reply.data(), (int)reply.size(), 0);
+        ipc_close_sock(c);
+    }
+    return 0;
+}
+
+int DEBUG_IPC_BreakRequested(void) {
+    if (ipc_break_flag) {
+        ipc_break_flag = 0;
+        return 1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -666,6 +772,90 @@ static int ipc_cmd_regs(const IpcRequest& req) {
     return 0;
 }
 
+static int ipc_cmd_mem_write(const IpcRequest& req) {
+    const std::string* pseg = ipc_arg(req, "seg");
+    const std::string* poff = ipc_arg(req, "off");
+    const std::string* phex = ipc_arg(req, "hex");
+    unsigned long long seg = 0, off = 0;
+    if (!pseg || !poff || !phex ||
+        !ipc_hex(*pseg, &seg) || !ipc_hex(*poff, &off) ||
+        seg > 0xFFFFull || off > 0xFFFFull) {
+        ipc_send_line("{\"id\":0,\"ok\":false,\"error\":\"mem_write wants "
+                      "seg,off,hex\"}\n");
+        return 0;
+    }
+    const std::string& hex = *phex;
+    if (hex.empty() || hex.size() % 2 ||
+        hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos ||
+        hex.size() / 2 > 128) {
+        ipc_send_line("{\"id\":0,\"ok\":false,\"error\":\"mem_write hex must "
+                      "be 1..128 bytes\"}\n");
+        return 0;
+    }
+    /* Named write path: reuse the debugger's own SM command semantics
+     * (space-separated byte values after seg:off). */
+    std::string spaced;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        if (!spaced.empty())
+            spaced += ' ';
+        spaced += hex.substr(i, 2);
+    }
+    std::string command = "SM " + ipc_hex16((unsigned)seg) + ":" +
+                          ipc_hex32(off) + " " + spaced;
+    char buffer[512];
+    snprintf(buffer, sizeof(buffer), "%s", command.c_str());
+    if (!ParseCommand(buffer)) {
+        char b[96];
+        snprintf(b, sizeof(b),
+                 "{\"id\":%lld,\"ok\":false,\"error\":\"SM rejected\"}\n",
+                 req.id);
+        ipc_send_line(b);
+        return 0;
+    }
+    char b[96];
+    snprintf(b, sizeof(b), "{\"id\":%lld,\"ok\":true,\"written\":%u}\n",
+             req.id, (unsigned)(hex.size() / 2));
+    ipc_send_line(b);
+    return 0;
+}
+
+static int ipc_cmd_reg_write(const IpcRequest& req) {
+    const std::string* preg = ipc_arg(req, "reg");
+    const std::string* pval = ipc_arg(req, "value");
+    unsigned long long value = 0;
+    if (!preg || !pval || preg->empty() || preg->size() > 8 ||
+        preg->find_first_not_of("abcdefghijklmnopqrstuvwxyz"
+                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                "0123456789") != std::string::npos ||
+        !ipc_hex(*pval, &value) || value > 0xFFFFFFFFull) {
+        ipc_send_line("{\"id\":0,\"ok\":false,\"error\":\"reg_write wants "
+                      "reg,value\"}\n");
+        return 0;
+    }
+    /* Named write path: SR label value (writes the register's low word for
+     * 16-bit labels, matching the debugger console semantics). */
+    std::string upper;
+    for (char c : *preg)
+        upper += (char)toupper((unsigned char)c);
+    std::string command = "SR " + upper + " " + ipc_hex32(value);
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "%s", command.c_str());
+    if (!ParseCommand(buffer)) {
+        char b[96];
+        snprintf(b, sizeof(b),
+                 "{\"id\":%lld,\"ok\":false,\"error\":\"SR rejected\"}\n",
+                 req.id);
+        ipc_send_line(b);
+        return 0;
+    }
+    char b[96];
+    snprintf(b, sizeof(b),
+             "{\"id\":%lld,\"ok\":true,\"reg\":\"%s\",\"value\":\"%s\"}\n",
+             req.id, ipc_escape(upper.c_str()).c_str(), ipc_hex32(value).c_str());
+    ipc_send_line(b);
+    return 0;
+}
+
 static int ipc_cmd_mem_read(const IpcRequest& req) {
     const std::string* pseg = ipc_arg(req, "seg");
     const std::string* poff = ipc_arg(req, "off");
@@ -740,6 +930,8 @@ static int ipc_handle_line(const std::string& line) {
     if (req.cmd == "bplist")   return ipc_cmd_bplist(req);
     if (req.cmd == "regs")     return ipc_cmd_regs(req);
     if (req.cmd == "mem_read") return ipc_cmd_mem_read(req);
+    if (req.cmd == "mem_write") return ipc_cmd_mem_write(req);
+    if (req.cmd == "reg_write") return ipc_cmd_reg_write(req);
     if (req.cmd == "continue") return ipc_cmd_continue(req);
     if (req.cmd == "step")     return ipc_cmd_step(req);
     if (req.cmd == "quit")     return ipc_cmd_quit(req);
