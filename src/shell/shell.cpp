@@ -64,7 +64,6 @@ extern bool dos_shell_running_program, mountwarning, winautorun;
 extern bool startcmd, startwait, startquiet, internal_program;
 extern bool addovl, addipx, addne2k, enableime, showdbcs;
 extern bool halfwidthkana, force_conversion, gbk, uselangcp, chinasea;
-extern const char* RunningProgram;
 extern int enablelfn, msgcodepage, lastmsgcp;
 extern uint16_t countryNo;
 extern unsigned int dosbox_shell_env_size;
@@ -77,6 +76,12 @@ char char_yes = 'y', char_no = 'n'; // YES NO CHARS in lower case
 uint16_t shell_psp = 0;
 Bitu call_int2e = 0;
 Bitu call_int23 = 0;
+
+#if defined(C_DOSBOX_AGENT)
+uint16_t DOS_ShellGetPSP() {
+	return shell_psp;
+}
+#endif
 
 std::string GetDOSBoxXPath(bool withexe=false);
 const char* DOS_GetLoadedLayout(void);
@@ -143,11 +148,15 @@ void SHELL_ProgramStart(Program * * make) {
 //Repeat it with the correct type, could do it in the function below, but this way it should be
 //clear that if the above function is changed, this function might need a change as well.
 static void SHELL_ProgramStart_First_shell(DOS_Shell * * make) {
-	*make = new DOS_Shell;
+	DOS_Shell *sh = new DOS_Shell;
+	sh->free_your_own_psp = true; /* shell does not exit normally using INT 21h and must free it's own memory by itself */
+	*make = sh;
 }
 #if !defined(OSFREE)
 static void SHELL_ProgramStart_Config_shell(DOS_Shell * * make) {
-	*make = new DOS_ConfigShell;
+	DOS_ConfigShell *sh = new DOS_ConfigShell;
+	sh->free_your_own_psp = true; /* shell does not exit normally using INT 21h and must free it's own memory by itself */
+	*make = sh;
 }
 #endif
 
@@ -326,9 +335,9 @@ DOS_Shell::~DOS_Shell() {
 	/* shell termination is not handled like a normal program.
 	 * memory allocated by the shell is not automatically freed on termination.
 	 * files are not automatically closed */
-	if (psp->GetSegment()) {
+	if (free_your_own_psp && psp && psp->GetSegment()) {
 		DOS_FreeProcessMemory(psp->GetSegment());
-
+        free_your_own_psp = false;
 		/* NTS: DOS_PSP would ideally allow JFT handle operations regardless of whatever the
 		 *      current PSP segment is, but that's not how the code is written */
 		const uint16_t o_psp = dos.psp();
@@ -485,7 +494,7 @@ public:
 		return true;
 	}
 	bool Close() override { return true; }
-	uint16_t GetInformation(void) override { return (strcmp(RunningProgram, "WCLIP") ? DeviceInfoFlags::Device : 0) | DeviceInfoFlags::EofOnInput; }
+	uint16_t GetInformation(void) override { return (RunningProgram == "WCLIP" ? 0 : DeviceInfoFlags::Device) | DeviceInfoFlags::EofOnInput; }
 	bool ReadFromControlChannel(PhysPt bufptr,uint16_t size,uint16_t * retcode) override { (void)bufptr; (void)size; (void)retcode; return false; }
 	bool WriteToControlChannel(PhysPt bufptr,uint16_t size,uint16_t * retcode) override { (void)bufptr; (void)size; (void)retcode; return false; }
 };
@@ -928,7 +937,7 @@ void showWelcome(Program *shell) {
         if (IS_DOSV) {
             shell->WriteOut(ParseMsg((std::string("\033[44;1m\xBA ")+str_replace(MSG_Get("SHELL_STARTUP_DOSV"), "\n", " \xBA\033[0m\033[44;1m\xBA ")+std::string(" \xBA\033[0m")).c_str()));
             shell->WriteOut(ParseMsg("\033[44;1m\xBA                                                                              \xBA\033[0m"));
-        } else if (machine == MCH_CGA || machine == MCH_PCJR || machine == MCH_AMSTRAD) {
+        } else if (machine == MCH_CGA || machine == MCH_PCJR || machine == MCH_AMSTRAD || machine == MCH_OLIVETTI || machine == MCH_3270PC) {
             shell->WriteOut(ParseMsg((std::string("\033[44;1m\xBA ")+str_replace(MSG_Get(mono_cga?"SHELL_STARTUP_CGA_MONO":"SHELL_STARTUP_CGA"), "\n", " \xBA\033[0m\033[44;1m\xBA ")+std::string(" \xBA\033[0m")).c_str()));
             shell->WriteOut(ParseMsg("\033[44;1m\xBA                                                                              \xBA\033[0m"));
         } else if (machine == MCH_HERC || machine == MCH_MDA) {
@@ -1335,10 +1344,32 @@ public:
                     cmd += "@if not '%CONFIG%'=='' %CONFIG%";
                 } else {
                     std::string batname;
+                    std::string batargs;
                     //LOG_MSG("auto_bat_additional %s\n", str.c_str());
 
-                    std::replace(str.begin(),str.end(),'/','\\');
                     size_t pos = std::string::npos;
+                    size_t argpos = std::string::npos;
+                    size_t extpos = std::string::npos;
+                    const char* exts[] = { ".bat", ".exe", ".com" };
+                    for(size_t p = 0; p + 4 <= str.size() && extpos == std::string::npos; p++) {
+                        if(str[p] == '.') {
+                            size_t end = p + 4;
+                            for(size_t i = 0; i < 3; i++) {
+                                if(!strcasecmp(str.substr(p, 4).c_str(), exts[i]) &&
+                                    (end == str.size() || str[end] == ' ')) {
+                                    extpos = p;
+                                    argpos = end;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if(argpos != std::string::npos && argpos < str.size()) {
+                        batargs = str.substr(argpos);
+                        trim(batargs);
+                        str.erase(argpos);
+                    }
+                    std::replace(str.begin(), str.end(), '/', '\\');
                     bool lead = false;
                     for (unsigned int j=0; j<str.size(); j++) {
                         if (lead) lead = false;
@@ -1368,7 +1399,11 @@ public:
 #endif
                     cmd += "@CALL \"";
                     cmd += batname;
-                    cmd += "\"" + opt + "\n";
+                    cmd += "\"";
+                    if(!batargs.empty()) {
+                        cmd += " " + batargs;
+                    }
+                    cmd += opt + "\n";
                     if (templfn) cmd += "@config -set lfn=" + std::string(enablelfn==-1?"auto":"autostart") + "\n";
 #if defined(WIN32) && !defined(HX_DOS)
                     if (!winautorun) cmd += "@config -set startcmd=false\n";
@@ -1924,6 +1959,7 @@ void SHELL_MessagesInit() {
 	MSG_Add("SHELL_CMD_VER_HELP_LONG","VER [/R]\n"
 			"VER [SET] number or VER SET [major minor]\n\n"
 			"  /R                 Display DOSBox-X's Git commit version and build date.\n"
+			"  /V                 Display DOSBox-X's reported DOS version.\n"
 			"  [SET] number       Set the specified number as the reported DOS version.\n"
 			"  SET [major minor]  Set the reported DOS version in major and minor format.\n\n"
 			"  \033[0mE.g., \033[37;1mVER 6.0\033[0m or \033[37;1mVER 7.1\033[0m sets the DOS version to 6.0 and 7.1, respectively.\n"
@@ -2049,11 +2085,6 @@ void SHELL_Init() {
 		DOS_SetMemAllocStrategy(savedMemAllocStrategy | 0x80);
 	}
 
-	// COMMAND.COM environment block
-	tmp = dosbox_shell_env_size>>4;
-	if (!DOS_AllocateMemory(&env_seg,&tmp)) E_Exit("COMMAND.COM failed to allocate environment block segment");
-	LOG_MSG("COMMAND.COM environment block:    0x%04x sz=0x%04x",env_seg,tmp);
-
 	// COMMAND.COM main binary (including PSP and stack)
 	if (tiny_memory_mode)
 		tmp = 0x13 + (1536/16);
@@ -2070,6 +2101,13 @@ void SHELL_Init() {
 	}
 
 	LOG_MSG("COMMAND.COM main body (PSP):      0x%04x sz=0x%04x",psp_seg,tmp);
+
+	// COMMAND.COM environment block
+	// Allocate the environment after the shell body/PSP so the MCB chain and
+	// ownership layout matches DOS expectations for COMMAND.COM.
+	tmp = dosbox_shell_env_size>>4;
+	if (!DOS_AllocateMemory(&env_seg,&tmp)) E_Exit("COMMAND.COM failed to allocate environment block segment");
+	LOG_MSG("COMMAND.COM environment block:    0x%04x sz=0x%04x",env_seg,tmp);
 
 	DOS_SetMemAllocStrategy(savedMemAllocStrategy);
 
@@ -2332,6 +2370,7 @@ void DOS_ConfigShell::Run(void) {
 			const char *e = cfgstr;
 			while (e > b && *(e-1) == ' ') e--;
 			name = std::string(b,size_t(e-b));
+			for (auto &c : name) c = toupper(c);
 		}
 
 		if (*cfgstr == '=') {
@@ -2525,11 +2564,6 @@ void CONFIGSHELL_Init() {
 	auto savedMemAllocStrategy = DOS_GetMemAllocStrategy();
 	DOS_SetMemAllocStrategy(2/*last fit*/);
 
-	// COMMAND.COM environment block
-	tmp = dosbox_shell_env_size>>4;
-	if (!DOS_AllocateMemory(&env_seg,&tmp)) E_Exit("COMMAND.COM failed to allocate environment block segment");
-	LOG_MSG("COMMAND.COM environment block:    0x%04x sz=0x%04x",env_seg,tmp);
-
 	// COMMAND.COM main binary (including PSP and stack)
 	if (tiny_memory_mode)
 		tmp = 0x13 + (1536/16);
@@ -2547,6 +2581,14 @@ void CONFIGSHELL_Init() {
 
 	LOG_MSG("COMMAND.COM main body (PSP):      0x%04x sz=0x%04x",psp_seg,tmp);
 
+	// COMMAND.COM environment block
+	// Keep the same allocation order as SHELL_Init(): allocate environment
+	// after shell body/PSP so config-phase COMMAND.COM has expected MCB layout
+	// for DOS-era software that scans ownership via MCB traversal.
+	tmp = dosbox_shell_env_size>>4;
+	if (!DOS_AllocateMemory(&env_seg,&tmp)) E_Exit("COMMAND.COM failed to allocate environment block segment");
+	LOG_MSG("COMMAND.COM environment block:    0x%04x sz=0x%04x",env_seg,tmp);
+
 	DOS_SetMemAllocStrategy(savedMemAllocStrategy);
 
 	// now COMMAND.COM has a main body and PSP segment, reflect it
@@ -2556,13 +2598,13 @@ void CONFIGSHELL_Init() {
 	{
 		DOS_MCB mcb((uint16_t)(env_seg-1));
 		mcb.SetPSPSeg(psp_seg);
-		mcb.SetFileName("CONFIG");
+		mcb.SetFileName("CFGSHELL");
 	}
 
 	{
 		DOS_MCB mcb((uint16_t)(psp_seg-1));
 		mcb.SetPSPSeg(psp_seg);
-		mcb.SetFileName("CONFIG");
+		mcb.SetFileName("CFGSHELL");
 	}
 
 	// set the stack at 0x1A
@@ -2709,4 +2751,3 @@ void CONFIGSHELL_Run() {
 	}
 #endif
 }
-

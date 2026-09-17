@@ -20,6 +20,7 @@
 #include "cross.h"
 #include "support.h"
 #include "dos_inc.h"
+#include "logging.h"
 #include <string>
 #include <limits.h>
 #include <stdlib.h>
@@ -53,6 +54,14 @@ bool isKanji1_gbk(uint8_t chr), CodePageHostToGuestUTF16(char *d/*CROSS_LEN*/,co
 
 #if defined __MINGW32__
 #define _mkdir(x) mkdir(x)
+#endif
+
+#ifndef PATH_MAX
+#if defined(WIN32)
+#define PATH_MAX MAX_PATH
+#else
+#define PATH_MAX 4096 /* LINUX sets to 4096, while this varies from 260 to 4096 depending on platforms */
+#endif
 #endif
 
 int resolveopt = 1;
@@ -135,6 +144,18 @@ std::string Cross::GetPlatformResDir() {
     in = "/<DosBox-X$Dir>/resources";
 
 #elif defined(LINUX)
+    const char* appdir = getenv("APPDIR"); // Detect if running in an AppImage environment
+    if(appdir && appdir[0] == '/') {
+        in = std::string(appdir) + "/usr/share/dosbox-x";
+        struct stat info;
+        if((stat(in.c_str(), &info) == 0) && (info.st_mode & S_IFDIR)) {
+            in += CROSS_FILESPLIT;
+            LOG_MSG("Detected AppImage respath: %s", in.c_str());
+            return in;
+        }
+        in.clear();
+    }
+    
     const char* xdg_data_home = getenv("XDG_DATA_HOME");
     const std::string data_home =
         (xdg_data_home && xdg_data_home[0] == '/') ? xdg_data_home : "~/.local/share";
@@ -296,6 +317,18 @@ bool Cross::IsPathAbsolute(std::string const& in) {
 	if (in.size() > 1 && in[0] == '/' ) return true;
 #endif
 	return false;
+}
+
+std::string Cross::GetCurDir(void) {
+    std::string cur_dir;
+    std::unique_ptr<char[]> cwd(new char[PATH_MAX]);
+    if(getcwd(cwd.get(), PATH_MAX) != nullptr) {
+        cur_dir = std::string(cwd.get()) + CROSS_FILESPLIT;
+    }
+    else {
+        cur_dir.clear();
+    }
+    return cur_dir;
 }
 
 #if defined (WIN32)

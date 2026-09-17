@@ -18,10 +18,10 @@ jobs:
         uses: styfle/cancel-workflow-action@0.13.1
         with:
           access_token: ${{ github.token }}
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install libraries
         run: |
-          brew install autoconf automake nasm glfw glew coreutils sevenzip libslirp fluid-synth pkg-config libtool
+          brew install autoconf automake nasm glfw glew coreutils sevenzip libslirp fluid-synth pkg-config libtool ffmpeg@7
           mkdir -p package/dosbox-x
           mkdir -p package/dosbox-x-sdl2
           # cd vs/sdlnet && ./build-dosbox.sh
@@ -152,16 +152,16 @@ jobs:
       actions: write  # for styfle/cancel-workflow-action to cancel/stop running workflows
       contents: write # for actions/checkout to fetch code and softprops/action-gh-release
     if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Cancel previous runs
         uses: styfle/cancel-workflow-action@0.13.1
         with:
           access_token: ${{ github.token }}
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install libraries
         run: |
-          brew install autoconf automake nasm glfw glew coreutils sevenzip libslirp fluid-synth pkg-config libtool
+          brew install autoconf automake nasm glfw glew coreutils sevenzip libslirp fluid-synth pkg-config libtool ffmpeg@7
           mkdir -p package/dosbox-x
           mkdir -p package/dosbox-x-sdl2
           # cd vs/sdlnet && ./build-dosbox.sh
@@ -259,6 +259,7 @@ jobs:
           make dosbox-x.app
           mv dosbox-x.app $top/package/dosbox-x
       - name: Build macOS ARM SDL2 OSFREE
+        if: steps.osfree.outputs.osfree != 'true'
         run: |
           top=`pwd`
           ./build-macos-sdl2
