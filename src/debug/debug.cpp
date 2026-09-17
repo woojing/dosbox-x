@@ -670,7 +670,6 @@ public:
 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
 	static bool				DeleteBreakpoint		(CBreakpoint* breakpoint);
 	static bool				DeleteByIndex		(uint16_t index);
-	static bool				DeleteBreakpoint	(CBreakpoint* bp);
 	static int				Count				(void);
 	static CBreakpoint*		GetByIndex			(int index);
 	static void				DeleteAll			(void);
@@ -955,6 +954,10 @@ CBreakpoint* CBreakpoint::GetByIndex(int index)
 	return nullptr;
 }
 
+#if !defined(C_DOSBOX_AGENT)
+/* Non-agent build of the pointer-delete overload (the debugger IPC uses
+ * it). The agent build compiles its own version further below, which also
+ * clears lastTriggered; mirror that detail here. */
 bool CBreakpoint::DeleteBreakpoint(CBreakpoint* bp)
 {
 	if (bp == nullptr)
@@ -964,12 +967,15 @@ bool CBreakpoint::DeleteBreakpoint(CBreakpoint* bp)
 		if (*i == bp) {
 			(BPoints.erase)(i);
 			bp->Activate(false);
+			if (lastTriggered == bp)
+				lastTriggered = nullptr;
 			delete bp;
 			return true;
 		}
 	}
 	return false;
 }
+#endif
 
 CBreakpoint* CBreakpoint::FindPhysBreakpoint(uint16_t seg, uint32_t off, bool once)
 {
