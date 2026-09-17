@@ -60,6 +60,11 @@
 /* debug.cpp globals (codebase pattern: local extern declarations). */
 extern uint64_t GetAddress(uint16_t seg, uint32_t offset);
 
+/* savestates.cpp globals (codebase pattern: local extern declarations). */
+extern size_t GetGameState_Run(void);
+extern void SetGameState_Run(int value);
+extern bool noremark_save_state;
+
 #if !defined(WIN32)
 # include <sys/types.h>
 # include <sys/socket.h>
@@ -856,6 +861,114 @@ static int ipc_cmd_reg_write(const IpcRequest& req) {
     return 0;
 }
 
+/* ---- v1.2 savestate / loadstate ----
+ *
+ * Structured state-slot control so controllers do not have to synthesize
+ * the F12+S/F12+L mapper hotkeys (which only exist as host SDL events).
+ * Serviced from the debugger stop branch, so the serialized snapshot is
+ * race-free. These call the SaveState core directly instead of the
+ * SaveGameState()/LoadGameState() hotkey handlers: the handlers report
+ * failures through systemmessagebox(), which would block this loop when
+ * no operator is watching. Divergences from the hotkey path: the TTF
+ * font-size reset the load handler performs is skipped, and save-to-file
+ * mode (use_save_file) is not honored -- slot-based saving only. */
+
+static void ipc_state_send_slot_error(long long id, const char* cmd) {
+    char b[128];
+    snprintf(b, sizeof(b),
+             "{\"id\":%lld,\"ok\":false,\"error\":\"%s wants slot "
+             "0..9 (decimal, optional; defaults to the active slot)\"}\n",
+             id, cmd);
+    ipc_send_line(b);
+}
+
+static void ipc_state_send_ok(long long id, const char* cmd, size_t slot,
+                              size_t previous_slot) {
+    std::string name = SaveState::instance().getName(slot);
+    std::string r = "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"cmd\":\"" +
+                    cmd + "\",\"slot\":" + std::to_string(slot) +
+                    ",\"slot_label\":" + std::to_string(slot + 1) +
+                    ",\"slot_file\":\"" + std::to_string(slot + 1) +
+                    ".sav\",\"previous_slot\":" +
+                    std::to_string(previous_slot) + ",\"name\":\"" +
+                    ipc_escape(name.c_str()) + "\"}\n";
+    ipc_send_line(r);
+}
+
+static void ipc_state_send_fail(long long id, const char* cmd, size_t slot,
+                                const char* error) {
+    std::string r = "{\"id\":" + std::to_string(id) + ",\"ok\":false,\"cmd\":\"" +
+                    cmd + "\",\"slot\":" + std::to_string(slot) +
+                    ",\"error\":\"" + ipc_escape(error) + "\"}\n";
+    ipc_send_line(r);
+}
+
+/* Shared argument handling: optional decimal "slot" 0..9, defaulting to
+ * the active slot. Returns false (response already sent) on bad input. */
+static bool ipc_state_slot_arg(const IpcRequest& req, const char* cmd,
+                               size_t* slot) {
+    size_t active = GetGameState_Run();
+    *slot = active;
+    const std::string* pslot = ipc_arg(req, "slot");
+    if (pslot == nullptr)
+        return true;
+    unsigned long long v = 0;
+    if (!ipc_uint(*pslot, &v) || v >= SaveState::SLOT_COUNT) {
+        ipc_state_send_slot_error(req.id, cmd);
+        return false;
+    }
+    *slot = (size_t)v;
+    return true;
+}
+
+static int ipc_cmd_savestate(const IpcRequest& req) {
+    size_t slot = 0;
+    if (!ipc_state_slot_arg(req, "savestate", &slot))
+        return 0;
+    size_t previous_slot = GetGameState_Run();
+    /* SaveState::save() prompts for a remark through a tinyfd modal
+     * unless suppressed; a modal here would deadlock the IPC loop (and
+     * the whole emulator) with no operator present. Force the
+     * non-interactive path for the duration of the call. */
+    bool prev_noremark = noremark_save_state;
+    noremark_save_state = true;
+    try {
+        SaveState::instance().save(slot);
+        noremark_save_state = prev_noremark;
+    } catch (const SaveState::Error& err) {
+        noremark_save_state = prev_noremark;
+        ipc_state_send_fail(req.id, "savestate", slot, err.c_str());
+        return 0;
+    }
+    /* Explicit-slot saves must not move the menu's active slot (same
+     * discipline as the vga_draw autosave path). */
+    if (slot != previous_slot)
+        SetGameState_Run((int)previous_slot);
+    ipc_state_send_ok(req.id, "savestate", slot, previous_slot);
+    return 0;
+}
+
+static int ipc_cmd_loadstate(const IpcRequest& req) {
+    size_t slot = 0;
+    if (!ipc_state_slot_arg(req, "loadstate", &slot))
+        return 0;
+    size_t previous_slot = GetGameState_Run();
+    if (SaveState::instance().isEmpty(slot)) {
+        ipc_state_send_fail(req.id, "loadstate", slot, "slot is empty");
+        return 0;
+    }
+    try {
+        SaveState::instance().load(slot);
+    } catch (const SaveState::Error& err) {
+        ipc_state_send_fail(req.id, "loadstate", slot, err.c_str());
+        return 0;
+    }
+    if (slot != previous_slot)
+        SetGameState_Run((int)previous_slot);
+    ipc_state_send_ok(req.id, "loadstate", slot, previous_slot);
+    return 0;
+}
+
 static int ipc_cmd_mem_read(const IpcRequest& req) {
     const std::string* pseg = ipc_arg(req, "seg");
     const std::string* poff = ipc_arg(req, "off");
@@ -932,6 +1045,8 @@ static int ipc_handle_line(const std::string& line) {
     if (req.cmd == "mem_read") return ipc_cmd_mem_read(req);
     if (req.cmd == "mem_write") return ipc_cmd_mem_write(req);
     if (req.cmd == "reg_write") return ipc_cmd_reg_write(req);
+    if (req.cmd == "savestate") return ipc_cmd_savestate(req);
+    if (req.cmd == "loadstate") return ipc_cmd_loadstate(req);
     if (req.cmd == "continue") return ipc_cmd_continue(req);
     if (req.cmd == "step")     return ipc_cmd_step(req);
     if (req.cmd == "quit")     return ipc_cmd_quit(req);
