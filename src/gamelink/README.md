@@ -14,6 +14,13 @@ revision 4 of the protocol, which is the latest one as of 2022-12-01. That
 reference implementation is based on DOSBox SVN, so it lacks a lot of
 features that DOSBox-X has.
 
+FORK DIVERGENCE: this fork extends the map to protocol v5 (in-band
+`version` = 5) with a 64-byte CPU register snapshot appended after
+`ram_size`, growing the core map and shifting the RAM mirror by 64 bytes.
+Named objects intentionally keep their R4 names. Clients that do not
+check `version` for exact equality (e.g. Grid Cartographer 4) will read
+the RAM mirror 64 bytes off against a v5 master.
+
 GameLink can operate in two modes: fully remote controlled, and tracking
 only.
 

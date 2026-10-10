@@ -17,6 +17,9 @@
 #include "gamelink.h"
 #include "logging.h"
 #include "sdlmain.h"
+#include "cpu.h"
+#include "cpu/lazyflags.h"
+#include "timer.h"
 #ifdef WIN32
 #include "../resource.h"
 #endif
@@ -51,7 +54,7 @@ extern uint32_t RunningProgramLoadAddress;
 
 #define SYSTEM_NAME		"DOSBox"
 
-#define PROTOCOL_VER		4
+#define PROTOCOL_VER		5
 
 #ifdef WIN32
 #define GAMELINK_MUTEX_NAME		"DWD_GAMELINK_MUTEX_R4"
@@ -94,6 +97,72 @@ static GameLink::sSharedMemoryMap_R4* g_p_shared_memory;
 //------------------------------------------------------------------------------
 // Local Functions
 //------------------------------------------------------------------------------
+
+// Register snapshot writer shared by GameLink::Out() and the heartbeat
+// ticker below. Callers must already hold the shared mutex and must not be
+// a snoop instance.
+static void gamelink_write_regs_snapshot()
+{
+	FillFlags();
+	GameLink::sSharedMMapRegs_R1& r = g_p_shared_memory->regs;
+	r.eip = (uint32_t)reg_eip;
+	r.esp = (uint32_t)reg_esp;
+	r.ebp = (uint32_t)reg_ebp;
+	r.esi = (uint32_t)reg_esi;
+	r.edi = (uint32_t)reg_edi;
+	r.eax = (uint32_t)reg_eax;
+	r.ebx = (uint32_t)reg_ebx;
+	r.ecx = (uint32_t)reg_ecx;
+	r.edx = (uint32_t)reg_edx;
+	r.eflags = (uint32_t)reg_flags;
+	r.program_load_phys = RunningProgramLoadAddress;
+	r.cs = SegValue( cs );
+	r.ds = SegValue( ds );
+	r.es = SegValue( es );
+	r.ss = SegValue( ss );
+	r.fs = SegValue( fs );
+	r.gs = SegValue( gs );
+	r.cpl = (uint8_t)cpu.cpl;
+	r.pmode = cpu.pmode ? 1 : 0;
+	++r.seq;
+}
+
+// Heartbeat: Out() only runs when a frame was actually drawn, so a guest
+// waiting on input with an unchanged screen stops advancing regs.seq and
+// liveness becomes indistinguishable from a wedged emulator. This ticker
+// runs from the emulator timer thread of control regardless of rendering,
+// throttled to ~60 Hz wall clock.
+static void gamelink_regs_tick()
+{
+	static uint32_t last_ms = 0;
+	uint32_t now_ms = GetTicks();
+	if ( now_ms - last_ms < 15 )
+		return;
+	last_ms = now_ms;
+
+	if ( g_p_shared_memory == NULL || sdl.gamelink.snoop )
+		return;
+
+	// Take the same named mutex Out() uses; never block the emulator on a
+	// slow client - skip this tick instead.
+#ifdef WIN32
+	DWORD wait = WaitForSingleObject( g_mutex_handle, 0 );
+	if ( wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED )
+		return;
+#else
+	int result = sem_trywait( g_mutex_handle );
+	if ( result < 0 )
+		return;
+#endif
+
+	gamelink_write_regs_snapshot();
+
+#ifdef WIN32
+	ReleaseMutex( g_mutex_handle );
+#else
+	sem_post( g_mutex_handle );
+#endif
+}
 
 static void shared_memory_init()
 {
@@ -143,6 +212,11 @@ static void shared_memory_init()
 
 	// RAM
 	g_p_shared_memory->ram_size = g_membase_size;
+
+	// regs: Windows can hand us a recycled mapping object (crashed master
+	// with a client still holding handles) whose old contents survive, so
+	// reset the block like every other field group instead of trusting zeros.
+	memset( &g_p_shared_memory->regs, 0, sizeof( g_p_shared_memory->regs ) );
 }
 
 //
@@ -249,6 +323,18 @@ static int create_shared_memory()
 
 	if ( g_mmap_handle )
 	{
+		if ( GetLastError() == ERROR_ALREADY_EXISTS )
+		{
+			// A client from an older protocol generation (or a crashed
+			// master's leftover) still holds this named object; the view
+			// below may then be smaller than this build's map and the
+			// allocation path dies with a misleading size error. Name the
+			// real cause so the operator closes the stale process.
+			LOG_MSG( "GAMELINK: mapping '%s' already exists - close stale "
+					"GameLink processes (older protocol builds keep the "
+					"old, smaller object alive)", GAMELINK_MMAP_NAME );
+		}
+
 		g_p_shared_memory = reinterpret_cast< GameLink::sSharedMemoryMap_R4* >(
 			MapViewOfFile( g_mmap_handle, FILE_MAP_ALL_ACCESS, 0, 0, memory_map_size )
 			);
@@ -423,6 +509,11 @@ uint8_t* GameLink::AllocRAM( const uint32_t size )
 
 	GameLink::InitTerminal();
 
+	// Heartbeat so regs.seq keeps advancing even when nothing renders
+	// (guest waiting on input with an unchanged screen skips GFX_EndUpdate).
+	if ( !sdl.gamelink.snoop )
+		TIMER_AddTickHandler( &gamelink_regs_tick );
+
 	const int memory_map_size = MEMORY_MAP_CORE_SIZE + g_membase_size;
 	LOG_MSG( "GAMELINK: Initialised. Allocated %d MB of shared memory.", (memory_map_size + (1024*1024) - 1) / (1024*1024) );
 
@@ -454,6 +545,8 @@ void GameLink::Term()
 	// SEND ABORT CODE TO CLIENT (don't care if it fails)
 	if (!sdl.gamelink.snoop && g_p_shared_memory)
 		g_p_shared_memory->version = 0;
+
+	TIMER_DelTickHandler( &gamelink_regs_tick );
 
 	destroy_shared_memory();
 
@@ -598,6 +691,12 @@ void GameLink::Out( const uint16_t frame_width,
 
 			// Store flags
 			g_p_shared_memory->flags = flags;
+
+			// Register snapshot (protocol v5). Runs in every Out() context
+			// (frame, trackonly, pause ticks) on the emulator thread, but
+			// never in snoop mode: a snooping instance must not interleave
+			// writes with the owning master.
+			gamelink_write_regs_snapshot();
 
 			if ( g_trackonly_mode == false )
 			{

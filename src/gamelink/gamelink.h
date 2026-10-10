@@ -101,6 +101,35 @@ namespace GameLink
 	};
 
 	//
+	// sSharedMMapRegs_R1
+	//
+	// CPU register snapshot (added for protocol v5).
+	//
+	// Written by the master on every GameLink::Out() call under the shared
+	// mutex, including FLAG_NO_FRAME (trackonly) mode and the pause loop's
+	// ~10 Hz ticks; seq is the only liveness indicator in frame-less modes.
+	// Sampled at frame handoff on the emulator thread (the same thread that
+	// mutates the CPU core), so a mutex-locking reader never observes torn
+	// fields. eflags is valid only because the master calls FillFlags()
+	// before storing (DOSBox-X keeps flags lazy). program_load_phys is the
+	// physical byte address of the loaded DOS image (segment<<4, 0 = none);
+	// clients derive the per-run relocation delta from it directly instead
+	// of the config-entangled gamelink load-address offset.
+	//
+	struct sSharedMMapRegs_R1
+	{
+		uint32_t seq;               // ++ per Out() call, published last
+		uint32_t eip, esp, ebp, esi, edi;
+		uint32_t eax, ebx, ecx, edx;
+		uint32_t eflags;            // post-FillFlags() low 32 bits
+		uint32_t program_load_phys; // RunningProgramLoadAddress
+		uint16_t cs, ds, es, ss, fs, gs;
+		uint8_t  cpl;               // (uint8_t)cpu.cpl
+		uint8_t  pmode;             // cpu.pmode ? 1 : 0
+		uint16_t reserved0;         // size 64, natural alignment
+	};
+
+	//
 	// sSharedMemoryMap_R4
 	//
 	// Memory Map (top-level object)
@@ -137,7 +166,16 @@ namespace GameLink
 
 		// added for protocol v4
 		uint32_t ram_size;
+
+		// added for protocol v5
+		sSharedMMapRegs_R1 regs;
 	};
+
+	// The named-object suffix (DWD_GAMELINK_*_R4) is deliberately frozen at
+	// R4: every consumer keys object names off it and POSIX stale-object
+	// purging depends on the exact string. Protocol revisions are signalled
+	// by the in-band `version` field only; clients must check it for exact
+	// equality because the RAM mirror offset follows the full core size.
 
 #pragma pack( pop )
 
