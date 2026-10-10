@@ -56,6 +56,9 @@
 #include "paging.h" /* mem_readb_checked */
 #include "../cpu/lazyflags.h"
 #include "logging.h"
+#include "mouse.h"
+
+extern void Mouse_SetClientCursorPos(int16_t x, int16_t y);
 
 /* debug.cpp globals (codebase pattern: local extern declarations). */
 extern uint64_t GetAddress(uint16_t seg, uint32_t offset);
@@ -1015,6 +1018,54 @@ static int ipc_cmd_mem_read(const IpcRequest& req) {
     return 0;
 }
 
+/* Named emulator input, separate from guest memory/register writes. A caller
+ * must bind every mutation to the current stopped CPU. It may release buttons
+ * during cleanup at an unknown game screen, but must reacquire UI ownership
+ * before pressing. These commands never resume execution by themselves. */
+static bool ipc_mouse_initialized = false;
+static uint8_t ipc_mouse_buttons = 0;
+
+static int ipc_cmd_mouse_input(const IpcRequest& req) {
+    unsigned long long expected_cs, ip, expected_ss, bp, sp, x, y, buttons;
+    const char* fields[] = {"cs", "ip", "ss", "bp", "sp", "x", "y", "buttons"};
+    unsigned long long* values[] = {&expected_cs, &ip, &expected_ss, &bp, &sp, &x, &y, &buttons};
+    for (unsigned i = 0; i < 8; ++i) {
+        const std::string* value = ipc_arg(req, fields[i]);
+        if (!value || !ipc_hex(*value, values[i])) {
+            ipc_send_line("{\"id\":" + std::to_string(req.id) +
+                          ",\"ok\":false,\"error\":\"mouse_input requires hexadecimal CPU and input fields\"}\n");
+            return 0;
+        }
+    }
+    if (expected_cs > 0xFFFF || ip > 0xFFFF || expected_ss > 0xFFFF || bp > 0xFFFF ||
+        sp > 0xFFFF || x >= 640 || y >= 480 || buttons > 7 || cpu.cpl != 0 ||
+        expected_cs != SegValue(cs) || ip != reg_eip || expected_ss != SegValue(ss) ||
+        bp != reg_ebp || sp != reg_esp) {
+        ipc_send_line("{\"id\":" + std::to_string(req.id) +
+                      ",\"ok\":false,\"error\":\"mouse_input bounds or stopped CPU guard mismatch\"}\n");
+        return 0;
+    }
+    if (!ipc_mouse_initialized && buttons != 0) {
+        ipc_send_line("{\"id\":" + std::to_string(req.id) +
+                      ",\"ok\":false,\"error\":\"mouse_input must establish released ownership first\"}\n");
+        return 0;
+    }
+    Mouse_SetClientCursorPos((int16_t)x, (int16_t)y);
+    for (uint8_t i = 0; i < 3; ++i) {
+        const uint8_t mask = (uint8_t)(1u << i);
+        if (!ipc_mouse_initialized || ((ipc_mouse_buttons & mask) && !(buttons & mask)))
+            Mouse_ButtonReleased(i);
+        if ((buttons & mask) && !(ipc_mouse_buttons & mask))
+            Mouse_ButtonPressed(i);
+    }
+    ipc_mouse_initialized = true;
+    ipc_mouse_buttons = (uint8_t)buttons;
+    ipc_send_line("{\"id\":" + std::to_string(req.id) +
+                  ",\"ok\":true,\"accepted\":true,\"state\":\"stopped\",\"buttons\":" +
+                  std::to_string(buttons) + ",\"delivery\":\"emulator_mouse_api\"}\n");
+    return 0;
+}
+
 static int ipc_handle_line(const std::string& line) {
     if (line.empty())
         return 0;
@@ -1026,7 +1077,7 @@ static int ipc_handle_line(const std::string& line) {
     if (req.cmd == "hello") {
         std::string r = "{\"id\":" + std::to_string(req.id) +
                         ",\"ok\":true,\"proto\":1,"
-                        "\"server\":\"dosbox-x-debugger-ipc\"," +
+                        "\"server\":\"dosbox-x-debugger-ipc\",\"features\":[\"stopped_mouse_v1\"]," +
                         ipc_state_json() + "}\n";
         ipc_send_line(r);
         return 0;
@@ -1043,6 +1094,7 @@ static int ipc_handle_line(const std::string& line) {
     if (req.cmd == "bplist")   return ipc_cmd_bplist(req);
     if (req.cmd == "regs")     return ipc_cmd_regs(req);
     if (req.cmd == "mem_read") return ipc_cmd_mem_read(req);
+    if (req.cmd == "mouse_input") return ipc_cmd_mouse_input(req);
     if (req.cmd == "mem_write") return ipc_cmd_mem_write(req);
     if (req.cmd == "reg_write") return ipc_cmd_reg_write(req);
     if (req.cmd == "savestate") return ipc_cmd_savestate(req);
