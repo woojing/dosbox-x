@@ -106,8 +106,12 @@ static GameLink::sSharedMemoryMap_R4* g_p_shared_memory;
 // Optional project-local running transport. Independent from protocol v5.
 // All access uses the existing GameLink mutex. Only this emulator-thread tick
 // copies CPU/RAM or injects input: shared MemBase itself is NOT a snapshot.
-#ifndef WIN32
+#ifdef WIN32
+#define HERO_LIVE_NAME "DWD_HERO_LIVE_V1"
+static HANDLE g_hero_live_handle = NULL;
+#else
 #define HERO_LIVE_NAME "/DWD_HERO_LIVE_V1"
+#endif
 static const uint32_t HERO_LIVE_MAGIC = 0x48525631;
 #pragma pack(push, 1)
 struct HeroLiveGuard {
@@ -138,6 +142,13 @@ static uint32_t g_hero_wait_started = 0;
 static void gamelink_live_init()
 {
     if (sdl.gamelink.snoop || g_membase_size < 0x100000) return;
+#ifdef WIN32
+    g_hero_live_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                           0, sizeof(HeroLiveMap), HERO_LIVE_NAME);
+    if (!g_hero_live_handle) { LOG_MSG("HERO_LIVE: CreateFileMapping failed: %lu", GetLastError()); return; }
+    void* ptr = MapViewOfFile(g_hero_live_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(HeroLiveMap));
+    if (!ptr) { CloseHandle(g_hero_live_handle); g_hero_live_handle = NULL; return; }
+#else
     int fd = shm_open(HERO_LIVE_NAME, O_CREAT | O_RDWR, 0600);
     if (fd < 0) { LOG_MSG("HERO_LIVE: shm_open failed: %d", errno); return; }
     // There is one GameLink master. Existing mappings survive a crash; a new
@@ -147,14 +158,24 @@ static void gamelink_live_init()
     void* ptr = mmap(NULL, sizeof(HeroLiveMap), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (ptr == MAP_FAILED) return;
+#endif
     g_hero_live = static_cast<HeroLiveMap*>(ptr);
     memset(g_hero_live, 0, sizeof(*g_hero_live));
+#ifdef WIN32
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    const uint32_t owner_pid = GetCurrentProcessId();
+    const uint64_t stamp = ((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime;
+#else
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
+    const uint32_t owner_pid = (uint32_t)getpid();
+    const uint64_t stamp = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+#endif
     g_hero_live->version = 1;
     g_hero_live->map_bytes = sizeof(HeroLiveMap);
-    g_hero_live->owner_pid = (uint32_t)getpid();
-    g_hero_live->generation = ((uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec) ^ ((uint64_t)getpid() << 32);
+    g_hero_live->owner_pid = owner_pid;
+    g_hero_live->generation = stamp ^ ((uint64_t)owner_pid << 32);
     g_hero_mouse_initialized = false;
     g_hero_mouse_buttons = 0;
     g_hero_wait_id = 0;
@@ -165,9 +186,15 @@ static void gamelink_live_term()
 {
     if (!g_hero_live) return;
     g_hero_live->magic = 0;
+#ifdef WIN32
+    UnmapViewOfFile(g_hero_live);
+    CloseHandle(g_hero_live_handle);
+    g_hero_live_handle = NULL;
+#else
     munmap(g_hero_live, sizeof(HeroLiveMap));
-    g_hero_live = NULL;
     shm_unlink(HERO_LIVE_NAME);
+#endif
+    g_hero_live = NULL;
 }
 
 // Bounded static UI-consumer poll contracts. A live owner frame can still
@@ -369,11 +396,6 @@ static void gamelink_live_tick()
         h.capture_done = h.capture_request;
     }
 }
-#else
-static void gamelink_live_init() {}
-static void gamelink_live_term() {}
-static void gamelink_live_tick() {}
-#endif
 
 // Register snapshot writer shared by GameLink::Out() and the heartbeat
 // heartbeat below. Callers must already hold the shared mutex and must not be
