@@ -5937,6 +5937,9 @@ void GFX_Events() {
 #endif
 
 #if C_GAMELINK
+    // Main emulator-thread polling survives savestate replacement of PIC's
+    // timer-handler list, including tracking-mode mouse waits with no redraw.
+    if (sdl.gamelink.enable) GameLink::PollLive();
     if (sdl.desktop.type == SCREEN_GAMELINK) OUTPUT_GAMELINK_InputEvent();
 #endif
 

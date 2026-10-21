@@ -191,6 +191,10 @@ namespace GameLink
 
 	extern void Term();
 
+    // Emulator-thread event-loop heartbeat. Independent of serialized PIC
+    // timers; services coherent live captures/input even when no frame draws.
+    extern void PollLive();
+
 	extern int In( sSharedMMapInput_R2* p_input,
 				   sSharedMMapAudio_R1* p_audio );
 

@@ -20,6 +20,8 @@
 #include "cpu.h"
 #include "cpu/lazyflags.h"
 #include "timer.h"
+#include "mouse.h"
+#include <time.h>
 #ifdef WIN32
 #include "../resource.h"
 #endif
@@ -44,6 +46,9 @@
 #include "SDL.h"
 
 extern bool is_paused;
+#if C_DEBUG
+extern bool IsDebuggerActive(void);
+#endif
 extern uint32_t RunningProgramLoadAddress;
 
 //==============================================================================
@@ -98,8 +103,280 @@ static GameLink::sSharedMemoryMap_R4* g_p_shared_memory;
 // Local Functions
 //------------------------------------------------------------------------------
 
+// Optional project-local running transport. Independent from protocol v5.
+// All access uses the existing GameLink mutex. Only this emulator-thread tick
+// copies CPU/RAM or injects input: shared MemBase itself is NOT a snapshot.
+#ifndef WIN32
+#define HERO_LIVE_NAME "/DWD_HERO_LIVE_V1"
+static const uint32_t HERO_LIVE_MAGIC = 0x48525631;
+#pragma pack(push, 1)
+struct HeroLiveGuard {
+    uint32_t offset, length;
+    uint8_t expected[64];
+};
+struct HeroLiveMap {
+    uint32_t magic, version, map_bytes, owner_pid;
+    uint64_t generation, capture_request, capture_done;
+    GameLink::sSharedMMapRegs_R1 regs;
+    char program[260];
+    uint64_t input_request, input_done, input_generation;
+    uint32_t input_load_phys, input_ss, input_owner_bp;
+    int32_t input_x, input_y;
+    uint32_t input_buttons, guard_count, receipt_status, receipt_reason;
+    GameLink::sSharedMMapRegs_R1 receipt_regs;
+    HeroLiveGuard guards[128];
+    uint8_t ram[0x100000];
+};
+#pragma pack(pop)
+static_assert(sizeof(HeroLiveMap) == 1058280, "hero live sidecar ABI drift");
+static HeroLiveMap* g_hero_live = NULL;
+static bool g_hero_mouse_initialized = false;
+static uint8_t g_hero_mouse_buttons = 0;
+static uint64_t g_hero_wait_id = 0;
+static uint32_t g_hero_wait_started = 0;
+
+static void gamelink_live_init()
+{
+    if (sdl.gamelink.snoop || g_membase_size < 0x100000) return;
+    int fd = shm_open(HERO_LIVE_NAME, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) { LOG_MSG("HERO_LIVE: shm_open failed: %d", errno); return; }
+    // There is one GameLink master. Existing mappings survive a crash; a new
+    // generation invalidates all prior captures, queued requests and receipts.
+    fchmod(fd, 0600);
+    if (ftruncate(fd, sizeof(HeroLiveMap)) != 0) { close(fd); return; }
+    void* ptr = mmap(NULL, sizeof(HeroLiveMap), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (ptr == MAP_FAILED) return;
+    g_hero_live = static_cast<HeroLiveMap*>(ptr);
+    memset(g_hero_live, 0, sizeof(*g_hero_live));
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    g_hero_live->version = 1;
+    g_hero_live->map_bytes = sizeof(HeroLiveMap);
+    g_hero_live->owner_pid = (uint32_t)getpid();
+    g_hero_live->generation = ((uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec) ^ ((uint64_t)getpid() << 32);
+    g_hero_mouse_initialized = false;
+    g_hero_mouse_buttons = 0;
+    g_hero_wait_id = 0;
+    g_hero_live->magic = HERO_LIVE_MAGIC;
+}
+
+static void gamelink_live_term()
+{
+    if (!g_hero_live) return;
+    g_hero_live->magic = 0;
+    munmap(g_hero_live, sizeof(HeroLiveMap));
+    g_hero_live = NULL;
+    shm_unlink(HERO_LIVE_NAME);
+}
+
+// Bounded static UI-consumer poll contracts. A live owner frame can still
+// exist during initialization or after a press, so ownership alone is not input
+// authority. Only the actual current instruction/helper path below is admitted.
+static bool hero_live_word(const uint8_t* ram, uint32_t ss, uint32_t off, uint32_t& value)
+{
+    const uint32_t address = ss * 16 + off;
+    if (off > 0xfffe || address + 2 > 0x100000) return false;
+    value = ram[address] | ((uint32_t)ram[address + 1] << 8);
+    return true;
+}
+
+static bool hero_live_frame(const uint8_t* ram, uint32_t ss, uint32_t bp,
+                            uint32_t& parent, uint32_t& ret, uint32_t& retseg,
+                            uint32_t& entry, uint32_t& segment)
+{
+    if (bp < 2 || bp > 0xfff0 || !hero_live_word(ram, ss, bp, parent) ||
+        !hero_live_word(ram, ss, bp + 2, ret) || !hero_live_word(ram, ss, bp + 4, retseg) ||
+        parent <= bp || parent > 0xfff0 || ret < 5) return false;
+    const uint32_t address = retseg * 16 + ret - 5;
+    if (address + 5 > 0x100000 || ram[address] != 0x9a) return false;
+    entry = ram[address + 1] | ((uint32_t)ram[address + 2] << 8);
+    segment = ram[address + 3] | ((uint32_t)ram[address + 4] << 8);
+    return true;
+}
+
+static bool hero_live_poll_ready(const uint8_t* ram, const HeroLiveMap& h)
+{
+    if ((RunningProgramLoadAddress & 15) || cpu.pmode || cpu.cpl) return false;
+    const uint32_t delta = RunningProgramLoadAddress >> 4;
+    const uint32_t stack_segment = SegValue(ss), code_segment = SegValue(cs);
+    const uint32_t ss = stack_segment, pc = reg_eip, cs = code_segment;
+    uint32_t bp = reg_ebp & 0xffff, sp = reg_esp & 0xffff;
+    if (ss != h.input_ss || ss != delta + 0x313a || SegValue(ds) != ss || sp > bp) return false;
+    uint32_t parent, ret, retseg, owner, ownerseg;
+    if (!hero_live_frame(ram, ss, h.input_owner_bp, parent, ret, retseg, owner, ownerseg)) return false;
+    if (!((ownerseg == delta + 0x1cb6 && (owner == 0x44de || owner == 0x5786)) ||
+          (ownerseg == delta + 0x0cf5 && (owner == 0x3310 || owner == 0x2c92 || owner == 0x3c5e)))) return false;
+    if (bp == h.input_owner_bp) {
+        if (cs != ownerseg) return false;
+        if (owner == 0x44de) return (pc >= 0x45ba && pc < 0x46f2) || (pc >= 0x4723 && pc < 0x4734);
+        if (owner == 0x5786) return (pc >= 0x5860 && pc < 0x5877) || (pc >= 0x5889 && pc < 0x58d2);
+        return false; // Lists/notices need an actual initialized polling helper.
+    }
+    uint32_t entry = 0, segment = cs;
+    if (cs == delta && pc >= 0xc505 && pc < 0xc57c) entry = 0xc502;
+    if (cs == delta + 0x0cf5) {
+        if (pc >= 0x105b && pc < 0x1085) entry = 0x1054;
+        else if (pc >= 0x10b5 && pc < 0x10d1) entry = 0x10b2;
+        else if (pc >= 0x10d9 && pc < 0x10f5) entry = 0x10d6;
+        else if (pc >= 0x127d && pc < 0x1293) entry = 0x127a;
+        else if (pc >= 0x1d34 && pc < 0x1d6c) entry = 0x1d2e;
+        else if (pc >= 0x1f8a && pc < 0x1fab) entry = 0x1f84;
+    }
+    if (!entry) return false;
+    uint32_t button = 0, array = 0;
+    for (unsigned depth = 0; depth < 12; ++depth) {
+        uint32_t a = 0, b = 0, c = 0, actual_entry, actual_segment;
+        if (!hero_live_frame(ram, ss, bp, parent, ret, retseg, actual_entry, actual_segment) ||
+            entry != actual_entry || segment != actual_segment) return false;
+        if (entry == 0xc502) {
+            if (!hero_live_word(ram, ss, bp + 6, a) || !hero_live_word(ram, ss, bp + 8, b) ||
+                !hero_live_word(ram, ss, bp + 10, c) || a != 0x33 || b != 0x64fe || c != 0x64fe ||
+                retseg != delta + 0x0cf5 || ret != 0x1290) return false;
+            entry = 0x127a;
+        } else if (entry == 0x127a) {
+            if (!hero_live_word(ram, ss, bp + 6, a) || !hero_live_word(ram, ss, bp + 8, b) ||
+                a != 0x64e2 || b != 3 || retseg != delta + 0x0cf5) return false;
+            if (ret == 0x1069) entry = 0x1054;
+            else if (ret == 0x10c5) entry = 0x10b2;
+            else if (ret == 0x10e9) entry = 0x10d6;
+            else return false;
+        } else if (entry == 0x1054 || entry == 0x10b2 || entry == 0x10d6) {
+            if (!hero_live_word(ram, ss, bp + 6, a) || a != 0x64e2) return false;
+            if (retseg == delta + 0x0cf5 && ((entry == 0x1054 && ret == 0x1d3c) || (entry == 0x10b2 && ret == 0x1d5c))) entry = 0x1d2e;
+            else if (retseg == delta + 0x1cb6 && entry == 0x10b2 && ret == 0x46f2) entry = 0x44de;
+            else if (retseg == delta + 0x1cb6 && entry == 0x10d6 && ret == 0x4734) entry = 0x44de;
+            else if (retseg == delta + 0x1cb6 && entry == 0x10b2 && (ret == 0x586b || ret == 0x5877)) entry = 0x5786;
+            else if (retseg == delta + 0x1cb6 && entry == 0x10d6 && ret == 0x58d2) entry = 0x5786;
+            else if (retseg == delta + 0x1cb6 && entry == 0x10b2 && ret == 0x5b73) entry = 0x5924;
+            else return false;
+        } else if (entry == 0x1d2e) {
+            if (!hero_live_word(ram, ss, bp + 6, button) || retseg != delta + 0x0cf5) return false;
+            if (ret == 0x1fab) entry = 0x1f84;
+            else if (ret == 0x3f77 || ret == 0x3f87 || ret == 0x3f9e) {
+                entry = 0x3c5e;
+                const uint32_t relative = ret == 0x3f77 ? 0x38 : ret == 0x3f87 ? 0x46 : 0x2a;
+                if (button != parent - relative) return false;
+            } else return false;
+        } else if (entry == 0x1f84) {
+            if (!hero_live_word(ram, ss, bp + 6, array) || bp < 1 || ram[ss * 16 + bp - 1] != 0xff || retseg != delta + 0x0cf5) return false;
+            if (ret == 0x369c) entry = 0x3310;
+            else if (ret == 0x3023) entry = 0x2c92;
+            else return false;
+            if (array != parent - 0xd8) return false;
+            if (button) {
+                const uint32_t count = ram[ss * 16 + array];
+                if (!count || count > 12 || button < array + 4 || (button - array - 4) % 14 || (button - array - 4) / 14 >= count) return false;
+            }
+        } else if (entry == 0x5924) {
+            if (!hero_live_word(ram, ss, bp + 6, a) || a != 0xe1bc || retseg != delta + 0x1cb6) return false;
+            if (ret == 0x45d1) entry = 0x44de;
+            else if (ret == 0x5895) entry = 0x5786;
+            else return false;
+        } else return false;
+        segment = retseg;
+        bp = parent;
+        if (bp == h.input_owner_bp) return entry == owner && segment == ownerseg;
+        if (bp > h.input_owner_bp) return false;
+    }
+    return false;
+}
+
+// A valid queued intent may arrive between polls. Keep that SAME request
+// pending for at most one wall-clock second; every tick rechecks owner and
+// decision bytes before admission. This never retransmits an accepted input.
+static bool hero_live_defer_poll(uint64_t request, uint32_t reason)
+{
+    if (reason != 8) { g_hero_wait_id = 0; return false; }
+    const uint32_t now = GetTicks();
+    if (g_hero_wait_id != request) {
+        g_hero_wait_id = request;
+        g_hero_wait_started = now;
+    }
+    return (uint32_t)(now - g_hero_wait_started) < 1000;
+}
+
+// Called while holding GameLink's mutex, from the GFX_Events/Out emulator
+// thread. Receipt status 1 = delivered to Mouse API, 2 = rejected; never an
+// assertion that the game consumed input or completed an action.
+static void gamelink_live_tick()
+{
+    if (!g_hero_live || !g_p_shared_memory || is_paused) return;
+#if C_DEBUG
+    // Out() also runs in debugger/pause display loops. These are not running
+    // captures and must not service live input or relabel stopped CPU state.
+    if (IsDebuggerActive()) return;
+#endif
+    HeroLiveMap& h = *g_hero_live;
+    uint8_t* ram = ((uint8_t*)g_p_shared_memory) + MEMORY_MAP_CORE_SIZE;
+    if (h.input_request && h.input_request != h.input_done) {
+        uint32_t reason = 0;
+        const bool release = h.input_buttons == 0 && h.input_x == -1 && h.input_y == -1;
+        if (h.input_generation != h.generation) reason = 1;
+        else if (!release && h.input_load_phys != RunningProgramLoadAddress) reason = 2;
+        else if (h.input_buttons > 7 || h.guard_count > 128 ||
+                 (!release && (h.input_x < 0 || h.input_x >= 640 || h.input_y < 0 || h.input_y >= 480 || !h.guard_count))) reason = 3;
+        else if (!release && is_paused) reason = 5;
+        else if (!release && h.input_buttons && !g_hero_mouse_initialized) reason = 6;
+        if (!reason && !release) {
+            // Stale stack bytes can survive a return. Require the nominated
+            // owner in the CURRENT increasing BP chain, never an RAM scan.
+            uint32_t bp = reg_ebp & 0xffff;
+            bool active_owner = false;
+            if (cpu.pmode || cpu.cpl || h.input_ss != SegValue(ss) || h.input_owner_bp < 2 || h.input_owner_bp > 0xfff0) reason = 7;
+            else for (uint32_t depth = 0; depth < 32; ++depth) {
+                if (bp == h.input_owner_bp) { active_owner = true; break; }
+                uint32_t address = (uint32_t)SegValue(ss) * 16 + bp;
+                if (bp < 2 || bp > 0xfff0 || address + 2 > 0x100000) break;
+                uint32_t parent = ram[address] | ((uint32_t)ram[address + 1] << 8);
+                if (parent <= bp || parent > 0xfff0) break;
+                bp = parent;
+            }
+            if (!active_owner) reason = 7;
+        }
+        if (!reason && !release) for (uint32_t i = 0; i < h.guard_count; ++i) {
+            const HeroLiveGuard& g = h.guards[i];
+            if (!g.length || g.length > 64 || g.offset >= 0x100000 || g.length > 0x100000 - g.offset) { reason = 3; break; }
+            if (memcmp(ram + g.offset, g.expected, g.length) != 0) { reason = 4; break; }
+        }
+        if (!reason && !release && !hero_live_poll_ready(ram, h)) reason = 8;
+        const bool defer = hero_live_defer_poll(h.input_request, reason);
+        if (!reason) {
+            if (!release) {
+                extern void Mouse_SetClientCursorPos(int16_t x, int16_t y);
+                Mouse_SetClientCursorPos((int16_t)h.input_x, (int16_t)h.input_y);
+            }
+            const uint8_t buttons = (uint8_t)h.input_buttons;
+            for (uint8_t i = 0; i < 3; ++i) {
+                const uint8_t mask = 1 << i;
+                if ((buttons & mask) && !(g_hero_mouse_buttons & mask)) Mouse_ButtonPressed(i);
+                if (!(buttons & mask) && ((g_hero_mouse_buttons & mask) || !g_hero_mouse_initialized || release)) Mouse_ButtonReleased(i);
+            }
+            g_hero_mouse_initialized = true;
+            g_hero_mouse_buttons = buttons;
+        }
+        if (!defer) {
+            h.receipt_status = reason ? 2 : 1;
+            h.receipt_reason = reason;
+            h.receipt_regs = g_p_shared_memory->regs;
+            h.input_done = h.input_request;
+        }
+    }
+    if (h.capture_request != h.capture_done) {
+        h.regs = g_p_shared_memory->regs;
+        memcpy(h.program, g_p_shared_memory->program, sizeof(h.program));
+        memcpy(h.ram, ram, sizeof(h.ram));
+        h.capture_done = h.capture_request;
+    }
+}
+#else
+static void gamelink_live_init() {}
+static void gamelink_live_term() {}
+static void gamelink_live_tick() {}
+#endif
+
 // Register snapshot writer shared by GameLink::Out() and the heartbeat
-// ticker below. Callers must already hold the shared mutex and must not be
+// heartbeat below. Callers must already hold the shared mutex and must not be
 // a snoop instance.
 static void gamelink_write_regs_snapshot()
 {
@@ -127,11 +404,9 @@ static void gamelink_write_regs_snapshot()
 	++r.seq;
 }
 
-// Heartbeat: Out() only runs when a frame was actually drawn, so a guest
-// waiting on input with an unchanged screen stops advancing regs.seq and
-// liveness becomes indistinguishable from a wedged emulator. This ticker
-// runs from the emulator timer thread of control regardless of rendering,
-// throttled to ~60 Hz wall clock.
+// Heartbeat: a mouse-wait loop may draw nothing, and savestate restoration
+// replaces PIC's serialized timer-handler list. GFX_Events calls this on the
+// emulator thread independently of rendering or that list, at ~60 Hz wall time.
 static void gamelink_regs_tick()
 {
 	static uint32_t last_ms = 0;
@@ -156,6 +431,7 @@ static void gamelink_regs_tick()
 #endif
 
 	gamelink_write_regs_snapshot();
+	gamelink_live_tick();
 
 #ifdef WIN32
 	ReleaseMutex( g_mutex_handle );
@@ -163,6 +439,14 @@ static void gamelink_regs_tick()
 	sem_post( g_mutex_handle );
 #endif
 }
+
+void GameLink::PollLive()
+{
+    // No timer/PIC registration: this must survive restoring old saved states
+    // without adding an unserializable function pointer to future saves.
+    gamelink_regs_tick();
+}
+
 
 static void shared_memory_init()
 {
@@ -506,13 +790,11 @@ uint8_t* GameLink::AllocRAM( const uint32_t size )
 
 	// Initialise
 	shared_memory_init();
+	gamelink_live_init();
 
 	GameLink::InitTerminal();
 
-	// Heartbeat so regs.seq keeps advancing even when nothing renders
-	// (guest waiting on input with an unchanged screen skips GFX_EndUpdate).
-	if ( !sdl.gamelink.snoop )
-		TIMER_AddTickHandler( &gamelink_regs_tick );
+	// Running heartbeat is polled by GFX_Events, not serialized PIC tickers.
 
 	const int memory_map_size = MEMORY_MAP_CORE_SIZE + g_membase_size;
 	LOG_MSG( "GAMELINK: Initialised. Allocated %d MB of shared memory.", (memory_map_size + (1024*1024) - 1) / (1024*1024) );
@@ -546,8 +828,8 @@ void GameLink::Term()
 	if (!sdl.gamelink.snoop && g_p_shared_memory)
 		g_p_shared_memory->version = 0;
 
-	TIMER_DelTickHandler( &gamelink_regs_tick );
 
+	gamelink_live_term();
 	destroy_shared_memory();
 
 	destroy_mutex( GAMELINK_MUTEX_NAME );
@@ -697,6 +979,9 @@ void GameLink::Out( const uint16_t frame_width,
 			// never in snoop mode: a snooping instance must not interleave
 			// writes with the owning master.
 			gamelink_write_regs_snapshot();
+            // Rendering also provides an emulator-thread, mutex-held chance
+            // to service requests; the GFX_Events heartbeat covers no drawing.
+            gamelink_live_tick();
 
 			if ( g_trackonly_mode == false )
 			{
